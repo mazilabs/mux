@@ -16,8 +16,8 @@ import (
 
 const (
 	// Layout
-	listWidthPercent = 2  // numerator of 5 (40%)
-	listWidthDenom   = 5  // denominator
+	listWidthPercent = 2 // numerator of 5 (40%)
+	listWidthDenom   = 5 // denominator
 	minPanelHeight   = 5
 
 	// Timing
@@ -51,17 +51,27 @@ type Model struct {
 	width          int
 	height         int
 	err            error
-	createModel      createModel
-	renameModel      renameModel
-	filterMod        filterModel
-	confirmKillMod   confirmKillModel
-	filterText       string
-	attachTarget     previewKey // set when we want to attach after quitting (zero value = no attach)
-	focusSession     string // session name to focus cursor on after next load
+	createModel    createModel
+	renameModel    renameModel
+	filterMod      filterModel
+	confirmKillMod confirmKillModel
+	filterText     string
+	attachTarget   previewKey       // set when we want to attach after quitting (zero value = no attach)
+	focusSession   string           // session name to focus cursor on after next load
 	previewContent string           // cached capture-pane output
 	previewKey     previewKey       // (session, window, pane) the cache belongs to
 	tokenUsage     *tmux.TokenUsage // cached token usage for current AI session
 	tokenSession   string           // session name the token cache belongs to
+
+	// Quick-cycle mode (OQ8, fork patch 2026-09-16): opened via
+	// `terminal-switcher --quick-cycle` (tmux M-Tab / Option+Tab).
+	// ESC+Tab advances the cursor (wrap); SIGUSR1 (Karabiner on Option
+	// release) commits the selection like Enter.
+	// docs/changelog/2026-09-16-b-option-tab-quick-switch.md
+	quickCycle    bool // --quick-cycle flag was passed
+	reverseStart  bool // --reverse-start: opened via reverse key → open on last row (OQ11)
+	pendingEsc    bool // ESC seen, waiting for Tab to cycle
+	firstLoadDone bool // first sessionsLoadedMsg already positioned the cursor
 }
 
 type tickMsg time.Time
@@ -138,9 +148,40 @@ func loadTokenUsage(sessionName string, panePID int) tea.Cmd {
 	}
 }
 
+// CycleCommitMsg asks the TUI to attach the row under the cursor and quit —
+// the same path Enter uses. Sent from main.go's SIGUSR1 handler when the
+// user releases the left Option key (Karabiner shell_command). Ignored
+// outside quick-cycle mode so a stray signal can never hijack the normal
+// Option+E popup.
+type CycleCommitMsg struct{}
+
+// escArmTimeoutMsg fires shortly after ESC in quick mode; if no Tab arrived
+// meanwhile, ESC alone keeps the delta-1 semantics and closes the popup.
+type escArmTimeoutMsg struct{}
+
+func escArmTimeout() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return escArmTimeoutMsg{} })
+}
+
 // NewModel returns a new Model with default settings.
 func NewModel() Model {
 	return Model{tree: newTreeState()}
+}
+
+// NewModelWithCycle returns a Model in quick-cycle mode (OQ8): the first
+// load places the cursor on row 2 (= previous session, guaranteed by the
+// ListSessions sort attached-first/activity-desc), ESC+Tab cycles with wrap,
+// and CycleCommitMsg attaches the selection.
+func NewModelWithCycle(c bool) Model {
+	return Model{tree: newTreeState(), quickCycle: c}
+}
+
+// NewModelQuickCycleStart (OQ11): reverse=true opens on the LAST row, so the
+// opening tap itself counts as the first reverse step (wrap from row 1).
+// The opening keystroke is consumed by tmux display-popup and never reaches
+// the TUI, so the direction must be passed as a flag.
+func NewModelQuickCycleStart(cycle, reverse bool) Model {
+	return Model{tree: newTreeState(), quickCycle: cycle, reverseStart: reverse}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -153,6 +194,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
+
+	case CycleCommitMsg:
+		if !m.quickCycle {
+			return m, nil // normal Option+E popup: signal must never attach
+		}
+		if it := m.currentItem(); it != nil {
+			m.attachTarget = previewKeyForItem(*it)
+		}
+		return m, tea.Quit
 
 	case tickMsg:
 		cmds := []tea.Cmd{loadSessions, tick()}
@@ -179,6 +229,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sessions = msg.sessions
 			m.tree.pruneCaches(m.sessions)
 			m.applyFilter()
+			if m.quickCycle && !m.firstLoadDone && len(m.items) > 0 {
+				if m.reverseStart {
+					// opened via reverse key (OQ11): first tap = wrap to last row
+					m.cursor = len(m.items) - 1
+				} else {
+					// Row 2 = previous session (attached-first sort).
+					m.cursor = min(1, len(m.items)-1)
+				}
+			}
+			m.firstLoadDone = true
 			if m.focusSession != "" {
 				for i, it := range m.items {
 					if it.kind == itemSession && it.session.Name == m.focusSession {
@@ -253,19 +313,66 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case escArmTimeoutMsg:
+		if m.pendingEsc {
+			return m, tea.Quit // ESC alone closes, delta-1 semantics kept
+		}
+		return m, nil
+
 	case tea.KeyMsg:
+		// Quick-cycle state machine: ESC armed the cycle, Tab consumes it.
+		// Any other key applies the normal ESC semantics first (close).
+		if m.quickCycle && m.pendingEsc {
+			if s := msg.String(); s == "tab" || s == "alt+tab" {
+				m.pendingEsc = false
+				if len(m.items) > 0 {
+					m.cursor = (m.cursor + 1) % len(m.items) // wrap at end
+				}
+				return m, m.refreshCurrentPreview()
+			}
+			return m, tea.Quit
+		}
+
 		switch msg.String() {
+		case "alt+tab":
+			// Primary cycle message: Ghostty/tmux deliver ESC+Tab as ONE
+			// read — Bubbletea v1.3.10 parses it as alt+tab, not esc+tab
+			// (key_sequences.go extSequences). Empirically verified 2026-09-16.
+			if m.quickCycle {
+				if len(m.items) > 0 {
+					m.cursor = (m.cursor + 1) % len(m.items)
+				}
+				return m, m.refreshCurrentPreview()
+			}
+			// normal mode: unhandled, old popup stays as-is
+
+		case "alt+ctrl+]":
+			// Reverse cycle (OQ11): ESC+GS bytes — Karabiner synthesizes
+			// Option+Shift+Tab from ^° → Ghostty keybind → tmux M-C-] → this
+			// single message (Gate ① winner 2026-09-17: pty-probe "alt+ctrl+]",
+			// ESC+BS rejected — tmux never fires a bind on those raw bytes).
+			// Quick mode only: a stray byte must not hijack the Option+E popup.
+			if m.quickCycle {
+				if len(m.items) > 0 {
+					m.cursor = (m.cursor - 1 + len(m.items)) % len(m.items) // wrap at top
+				}
+				return m, m.refreshCurrentPreview()
+			}
+			// normal mode: unhandled, old popup stays as-is
 		case "q", "ctrl+c":
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
+			// Mazilabs fork patch (OQ12, 2026-09-17): wrap at top — same
+			// modulo formula as the quick-cycle handlers above.
+			if len(m.items) > 0 {
+				m.cursor = (m.cursor - 1 + len(m.items)) % len(m.items) // wrap at top
 				return m, m.refreshCurrentPreview()
 			}
 		case "down", "j":
-			if m.cursor < len(m.items)-1 {
-				m.cursor++
+			// Mazilabs fork patch (OQ12, 2026-09-17): wrap at end.
+			if len(m.items) > 0 {
+				m.cursor = (m.cursor + 1) % len(m.items) // wrap at end
 				return m, m.refreshCurrentPreview()
 			}
 		case "g":
@@ -313,9 +420,19 @@ func (m Model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "esc":
+			if m.quickCycle {
+				// Arm the cycle: a Tab within 80 ms advances, otherwise the
+				// timeout closes (same as the old immediate quit).
+				m.pendingEsc = true
+				return m, escArmTimeout()
+			}
 			if m.filterText != "" {
 				m.filterText = ""
 				m.applyFilter()
+			} else {
+				// Mazilabs fork patch (OQ9, 2026-09-15): with no filter to
+				// clear, Escape closes the popup like q does.
+				return m, tea.Quit
 			}
 		}
 	}
@@ -606,7 +723,7 @@ func renderHelp() string {
 		{"x", "kill"},
 		{"r", "rename"},
 		{"/", "filter"},
-		{"q", "quit"},
+		{"q/esc", "quit"},
 	}
 
 	var parts []string

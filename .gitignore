@@ -1,5 +1,6 @@
-# Binary
-mux
+# Binary (root-anchored — unanchored "mux" would swallow the cmd/mux/ source dir)
+/mux
+/terminal-switcher
 *.exe
 
 # Build
